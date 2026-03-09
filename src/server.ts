@@ -17,20 +17,15 @@ connectDB();
 const app = express();
 
 // ─── CORS Configuration ─────────────────────────────────────────────────────
-// Both origins share the exact same allowedOrigins array — this ensures
-// the Express middleware and the Socket.IO CORS policy are always in sync.
+// TODO [SECURITY WALL]: Replace `origin: '*'` below with a strict allowedOrigins
+// whitelist before deploying to production. Example:
+//
+//   const allowedOrigins = [process.env.FRONTEND_URL, 'http://localhost:3000'].filter(Boolean);
+//   app.use(cors({ origin: allowedOrigins, credentials: true }));
+//
+// Same applies to the Socket.IO cors config further below.
 
-const allowedOrigins: string[] = [
-    process.env.FRONTEND_URL as string,
-    'http://localhost:3000',
-].filter(Boolean); // remove undefined if FRONTEND_URL is not set
-
-app.use(
-    cors({
-        origin: allowedOrigins,
-        credentials: true,
-    })
-);
+app.use(cors({ origin: '*' }));
 
 app.use(express.json());
 
@@ -40,9 +35,10 @@ const httpServer = createServer(app);
 
 // ─── Socket.IO Server ───────────────────────────────────────────────────────
 
+// TODO [SECURITY WALL]: Replace `origin: '*'` with the allowedOrigins whitelist (see above).
 export const io = new Server(httpServer, {
     cors: {
-        origin: allowedOrigins,
+        origin: '*',
         methods: ['GET', 'POST'],
     },
 });
