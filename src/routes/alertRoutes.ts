@@ -4,6 +4,18 @@ import { io } from '../server';
 
 const router = Router();
 
+// GET /api/alerts
+// Returns the most recent 50 alerts for dashboard hydration on load.
+router.get('/', async (_req: Request, res: Response) => {
+    try {
+        const alerts = await Alert.find().sort({ timestamp: -1 }).limit(50);
+        res.status(200).json({ success: true, alerts });
+    } catch (error) {
+        console.error('[History] Error fetching alerts:', error);
+        res.status(500).json({ success: false, error: 'Internal server error.' });
+    }
+});
+
 // POST /api/alerts/ingress
 // Called by the internet-connected gateway device to offload a mesh alert.
 router.post('/ingress', async (req: Request, res: Response) => {
