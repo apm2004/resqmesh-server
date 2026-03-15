@@ -67,73 +67,11 @@ const rescueKw = [
     'evacuating','injured','ambulance','rescue','help needed',
 ];
 const alertTypeKw: Record<string, string[]> = {
-    Fire:    ['fire','smoke','burning','gas leak','explosion','blaze'],
-    Flood:   ['flood','flooding','water rising','submerged','drainage','rain'],
-    Medical: ['injured','medical','hospital','ambulance','trauma','unconscious','bleeding'],
-    Rescue:  ['trapped','stranded','rescue','collapsed','buried','missing'],
+    Fire:    ['fire', 'smoke', 'burning', 'gas leak', 'explosion', 'blaze'],
+    Flood:   ['flood', 'flooding', 'water rising', 'submerged', 'drainage', 'rain'],
+    Medical: ['injured', 'medical', 'hospital', 'ambulance', 'trauma', 'unconscious', 'bleeding'],
+    Rescue:  ['trapped', 'stranded', 'rescue', 'collapsed', 'buried', 'missing'],
 };
-
-// ── Comprehensive disaster-relevance keywords (NLP gate) ─────────────────────
-// A post must contain at least ONE of these keywords (or have a valid flair)
-// to be considered disaster-relevant and saved to the database.
-const DISASTER_KEYWORDS: string[] = [
-    // --- Critical / life-threatening ---
-    'trapped', 'collapse', 'collapsed', 'sos', 'mayday', 'explosion',
-    'gas leak', 'casualties', 'critical', 'urgent', 'people died',
-    'dead', 'death toll', 'fatalities', 'life threatening',
-
-    // --- Rescue / stranded ---
-    'stranded', 'stuck', 'need rescue', 'cut off', 'rescue',
-    'missing', 'buried', 'pinned', 'help needed', 'help us',
-    'please help', 'save us', 'send help', 'need assistance',
-
-    // --- Fire ---
-    'fire', 'smoke', 'burning', 'blaze', 'wildfire', 'fire spreading',
-    'inferno', 'arson', 'engulfed',
-
-    // --- Flood / water ---
-    'flood', 'flooded', 'flooding', 'water rising', 'submerged',
-    'drainage', 'waterlogged', 'inundated', 'flash flood', 'dam breach',
-    'levee', 'overflow',
-
-    // --- Weather / natural disaster ---
-    'earthquake', 'quake', 'tremor', 'aftershock', 'tsunami',
-    'cyclone', 'hurricane', 'typhoon', 'tornado', 'storm',
-    'landslide', 'mudslide', 'avalanche', 'volcanic', 'eruption',
-    'hailstorm', 'lightning strike', 'drought',
-
-    // --- Medical ---
-    'injured', 'medical', 'hospital', 'ambulance', 'trauma',
-    'unconscious', 'bleeding', 'fracture', 'cardiac', 'oxygen',
-    'first aid', 'emergency medical', 'casualty', 'wound',
-
-    // --- Infrastructure ---
-    'power outage', 'grid failure', 'blackout', 'no electricity',
-    'road blocked', 'bridge collapse', 'road collapse', 'building collapse',
-    'structural damage', 'debris', 'rubble',
-
-    // --- Shelter / displacement ---
-    'shelter needed', 'displaced', 'evacuating', 'evacuation',
-    'homeless', 'refugee', 'relief camp', 'tent', 'temporary shelter',
-
-    // --- Food / water / supplies ---
-    'food', 'water', 'supplies needed', 'rations', 'drinking water',
-    'starvation', 'dehydration', 'hunger', 'no food', 'no water',
-
-    // --- General distress ---
-    'emergency', 'disaster', 'catastrophe', 'crisis', 'devastation',
-    'destruction', 'danger', 'hazard', 'warning', 'alert',
-    'distress', 'calamity', 'severe', 'desperate',
-];
-
-/**
- * Returns true if the post text contains at least one disaster-relevant keyword.
- * This is the NLP gate — posts that don't pass are silently dropped.
- */
-function isDisasterRelevant(text: string): boolean {
-    const lower = text.toLowerCase();
-    return DISASTER_KEYWORDS.some(kw => lower.includes(kw));
-}
 
 // ── Flair → AlertCategory canonical mapping ───────────────────────────────────
 // These must match the flairs set up on r/ResQMesh exactly (case-insensitive).
@@ -144,7 +82,7 @@ const FLAIR_TO_CATEGORY: Record<string, string> = {
     'trapped':         'TRAPPED',
     'general':         'GENERAL',
     'other':           'OTHER',
-    'critical':        'MEDICAL',   // r/ResQMesh uses 'Critical' flair
+    'critical':        'MEDICAL',   
     'food & water':    'FOOD',
     'food and water':  'FOOD',
 };
@@ -312,25 +250,10 @@ async function pollAndPersist(io: Server): Promise<void> {
             return; // silent — normal when polling every 10 s
         }
 
-        // ── NLP keyword gate: only keep disaster-relevant posts ──────────
-        // A post passes if it has a recognised flair OR its text contains
-        // at least one disaster keyword. Everything else is silently dropped.
-        const relevantPosts = newPosts.filter(p => {
-            const flair = (p.link_flair_text ?? '').trim().toLowerCase();
-            if (flair && FLAIR_TO_CATEGORY[flair]) return true;       // flair wins
-            const fullText = `${p.title} ${p.selftext}`;
-            return isDisasterRelevant(fullText);
-        });
+        console.log(`[RedditService] ${newPosts.length} new post(s) found — geocoding & saving…`);
 
-        if (!relevantPosts.length) {
-            console.log(`[RedditService] ${newPosts.length} new post(s) dropped — no disaster keywords found.`);
-            return;
-        }
-
-        console.log(`[RedditService] ${relevantPosts.length}/${newPosts.length} post(s) passed NLP filter — geocoding & saving…`);
-
-        // Geocode all relevant posts concurrently
-        const alerts = await Promise.all(relevantPosts.map(postToAlert));
+        // Convert all new posts to alerts (no keyword filtering!)
+        const alerts = await Promise.all(newPosts.map(postToAlert));
 
         // Bulk-insert (ordered: false → continue on duplicate key errors)
         await RedditAlert.insertMany(alerts.map(a => ({ ...a })), { ordered: false }).catch(() => {});
