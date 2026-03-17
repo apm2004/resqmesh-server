@@ -8,16 +8,10 @@ import cors from 'cors';
 import connectDB from './config/db';
 import alertRoutes from './routes/alertRoutes';
 import redditAlertRoutes from './routes/redditAlertRoutes';
+import demoRoutes from './routes/demoRoutes';
 import { startRedditPoller } from './services/redditService';
 
 // ─── Express App ────────────────────────────────────────────────────────────
-
-// ─── Database ───────────────────────────────────────────────────────────────
-
-connectDB().then(() => {
-    // Start the Reddit poller only after DB is ready so saves don't fail
-    startRedditPoller(io);
-});
 
 const app = express();
 
@@ -64,6 +58,7 @@ app.get('/', (_req, res) => {
 
 app.use('/api/alerts', alertRoutes);
 app.use('/api/reddit-alerts', redditAlertRoutes);
+app.use('/api/demo', demoRoutes);
 
 // ─── Start Listening ────────────────────────────────────────────────────────
 
@@ -71,4 +66,12 @@ const PORT = process.env.PORT ?? 5000;
 
 httpServer.listen(PORT, () => {
     console.log(`[Server] Listening on port ${PORT}`);
+});
+
+// ─── Database + Reddit Poller ────────────────────────────────────────────────
+// IMPORTANT: connectDB must be called AFTER `io` is created above,
+// so that `io` is fully initialized before startRedditPoller(io) uses it.
+
+connectDB().then(() => {
+    startRedditPoller(io);
 });

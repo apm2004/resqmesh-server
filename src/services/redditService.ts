@@ -1,10 +1,8 @@
 /**
  * redditService.ts
  *
- * Runs entirely on the Node.js backend.
- * Polls r/ResQMesh, geocodes new posts via Nominatim,
- * persists them to MongoDB, and broadcasts via Socket.IO.
- *
+ * Polls r/ResQMesh via the PUBLIC RSS FEED — no OAuth, no API keys needed.
+ * Geocodes new posts via Nominatim, persists to MongoDB, broadcasts via Socket.IO.
  * Called once from server.ts after DB is ready.
  */
 
@@ -12,283 +10,216 @@ import { Server } from 'socket.io';
 import RedditAlert from '../models/RedditAlert';
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const SUBREDDIT       = 'ResQMesh';
-const REDDIT_BASE     = `https://www.reddit.com/r/${SUBREDDIT}/new.json?limit=25`;
-const POLL_INTERVAL   = 10_000; // 10 seconds — fast enough for near-instant delivery
-const NOMINATIM_URL   = 'https://nominatim.openstreetmap.org/search';
-const USER_AGENT      = 'ResQMesh/1.0 (disaster-response-dashboard; server-poller)';
-const DEFAULT_COORDS  = { lat: 20.5937, lng: 78.9629 };
+const SUBREDDIT     = 'ResQMesh';
+// old.reddit.com + browser UA bypasses the 403 that www.reddit.com returns
+const REDDIT_URL    = `https://old.reddit.com/r/${SUBREDDIT}/new.json?limit=25`;
+const POLL_INTERVAL = 10_000;
+const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
+// Must look like a real browser — old.reddit.com checks User-Agent
+const USER_AGENT    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+const DEFAULT_COORDS = { lat: 20.5937, lng: 78.9629 }; // centre of India
 
-// Tracks the Reddit fullname (e.g. "t3_1rtplch") of the most recently seen post.
-// On subsequent polls we pass ?before=<name> so Reddit only returns newer posts.
-let latestPostName: string | null = null;
-
-// ── In-process geocode cache ─────────────────────────────────────────────────
+// ── Geocode cache ─────────────────────────────────────────────────────────────
 const geocodeCache = new Map<string, { lat: number; lng: number }>();
 
 async function geocode(query: string): Promise<{ lat: number; lng: number }> {
     const key = query.toLowerCase().trim();
     if (geocodeCache.has(key)) return geocodeCache.get(key)!;
-
     try {
-        const url = `${NOMINATIM_URL}?q=${encodeURIComponent(key)}&format=json&limit=1&addressdetails=0`;
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 5_000);
-        const res = await fetch(url, {
-            headers: { 'User-Agent': USER_AGENT, 'Accept-Language': 'en' },
-            signal: controller.signal,
-        });
-        clearTimeout(timer);
+        const url = `${NOMINATIM_URL}?q=${encodeURIComponent(key)}&format=json&limit=1`;
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 5_000);
+        const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT }, signal: ctrl.signal });
+        clearTimeout(t);
         if (res.ok) {
-            const data: Array<{ lat: string; lon: string }> = await res.json();
+            const data: { lat: string; lon: string }[] = await res.json();
             if (data.length) {
                 const coords = { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
                 geocodeCache.set(key, coords);
                 return coords;
             }
         }
-    } catch (err) {
-        console.warn(`[RedditService] Geocode failed for "${query}":`, err);
-    }
-
+    } catch { /* non-fatal */ }
     geocodeCache.set(key, DEFAULT_COORDS);
     return DEFAULT_COORDS;
 }
 
-// ── NLP keyword arrays (used by resolveUrgencyAndType below) ─────────────────
-const criticalKw = [
-    'trapped','collapse','collapsed','sos','mayday','explosion',
+// ── NLP helpers ───────────────────────────────────────────────────────────────
+const criticalKw = ['trapped','collapse','collapsed','sos','mayday','explosion',
     'gas leak','casualties','critical','urgent rescue','people died',
-    'power outage','grid failure','missing','buried','fire spreading',
-];
-const rescueKw = [
-    'stranded','stuck','flooded','flood','need rescue','cut off',
+    'power outage','grid failure','missing','buried','fire spreading'];
+const rescueKw   = ['stranded','stuck','flooded','flood','need rescue','cut off',
     'no electricity','road blocked','shelter needed','displaced',
-    'evacuating','injured','ambulance','rescue','help needed',
-];
-const alertTypeKw: Record<string, string[]> = {
-    Fire:    ['fire', 'smoke', 'burning', 'gas leak', 'explosion', 'blaze'],
-    Flood:   ['flood', 'flooding', 'water rising', 'submerged', 'drainage', 'rain'],
-    Medical: ['injured', 'medical', 'hospital', 'ambulance', 'trauma', 'unconscious', 'bleeding'],
-    Rescue:  ['trapped', 'stranded', 'rescue', 'collapsed', 'buried', 'missing'],
+    'evacuating','injured','ambulance','rescue','help needed'];
+const alertTypeKw: Record<string,string[]> = {
+    Fire:    ['fire','smoke','burning','gas leak','explosion','blaze'],
+    Flood:   ['flood','flooding','water rising','submerged','drainage','rain'],
+    Medical: ['injured','medical','hospital','ambulance','trauma','unconscious','bleeding'],
+    Rescue:  ['trapped','stranded','rescue','collapsed','buried','missing'],
+};
+const FLAIR_MAP: Record<string,string> = {
+    'medical':'MEDICAL','rescue':'RESCUE','food':'FOOD','trapped':'TRAPPED',
+    'general':'GENERAL','other':'OTHER','critical':'MEDICAL',
+    'food & water':'FOOD','food and water':'FOOD',
+};
+const FLAIR_LABEL: Record<string,string> = {
+    MEDICAL:'Medical',RESCUE:'Rescue',FOOD:'Food & Water',
+    TRAPPED:'Trapped',GENERAL:'General',OTHER:'Other',
 };
 
-// ── Flair → AlertCategory canonical mapping ───────────────────────────────────
-// These must match the flairs set up on r/ResQMesh exactly (case-insensitive).
-const FLAIR_TO_CATEGORY: Record<string, string> = {
-    'medical':         'MEDICAL',
-    'rescue':          'RESCUE',
-    'food':            'FOOD',
-    'trapped':         'TRAPPED',
-    'general':         'GENERAL',
-    'other':           'OTHER',
-    'critical':        'MEDICAL',   
-    'food & water':    'FOOD',
-    'food and water':  'FOOD',
-};
-
-// Human-readable label for each AlertCategory (mirrors alertConfig.ts on frontend)
-const CATEGORY_LABEL: Record<string, string> = {
-    MEDICAL: 'Medical',
-    RESCUE:  'Rescue',
-    FOOD:    'Food & Water',
-    TRAPPED: 'Trapped',
-    GENERAL: 'General',
-    OTHER:   'Other',
-};
-
-// ── Resolve urgency: flair wins, NLP is the fallback ─────────────────────────
-function resolveUrgencyAndType(
-    text: string,
-    flair: string
-): { urgency: string; alertType: string; sourcedFromFlair: boolean } {
-    const flairKey = flair.trim().toLowerCase();
-    if (flairKey && FLAIR_TO_CATEGORY[flairKey]) {
-        const urgency = FLAIR_TO_CATEGORY[flairKey];
-        return { urgency, alertType: CATEGORY_LABEL[urgency] ?? flair, sourcedFromFlair: true };
+function resolveUrgency(text: string, flair: string) {
+    const fk = flair.trim().toLowerCase();
+    if (fk && FLAIR_MAP[fk]) {
+        const urgency = FLAIR_MAP[fk];
+        return { urgency, alertType: FLAIR_LABEL[urgency] ?? flair, sourcedFromFlair: true };
     }
-
     const l = text.toLowerCase();
     let urgency = 'GENERAL';
     if (criticalKw.some(k => l.includes(k))) urgency = 'MEDICAL';
     else if (rescueKw.some(k => l.includes(k))) urgency = 'RESCUE';
-
     let alertType = 'Rescue';
-    for (const [type, kws] of Object.entries(alertTypeKw)) {
+    for (const [type, kws] of Object.entries(alertTypeKw))
         if (kws.some(k => l.includes(k))) { alertType = type; break; }
-    }
-
     return { urgency, alertType, sourcedFromFlair: false };
 }
 
-
-function extractLocationName(text: string): string | null {
+function extractLocation(text: string): string | null {
     const m1 = text.match(/location\s*[:\-]\s*([^\n,\.]{2,60})/i);
     if (m1) return m1[1].trim();
     const m2 = text.match(/(?:in|at|near|from)\s+([A-Z][a-zA-Z\s]{2,40})(?:[,\.\n]|$)/);
     if (m2) return m2[1].trim();
-    const m3 = text.match(/\(([A-Z][a-zA-Z\s]{2,30})\)/);
-    if (m3) return m3[1].trim();
     return null;
 }
 
-function calcConfidence(text: string, score: number): number {
+function confidence(text: string, score: number): number {
     const l = text.toLowerCase();
     let c = 40;
-    c += Math.min([...criticalKw, ...rescueKw].filter(k => l.includes(k)).length * 10, 40);
-    if (score > 10)  c += 5;
-    if (score > 50)  c += 5;
+    c += Math.min([...criticalKw,...rescueKw].filter(k => l.includes(k)).length * 10, 40);
+    if (score > 10) c += 5;
+    if (score > 50) c += 5;
     if (score > 100) c += 5;
     return Math.min(c, 97);
 }
 
-function timeAgo(utcSeconds: number): string {
-    const min = Math.floor((Date.now() - utcSeconds * 1000) / 60_000);
+function timeAgo(utcSec: number): string {
+    const min = Math.floor((Date.now() - utcSec * 1000) / 60_000);
     if (min < 1)  return 'just now';
     if (min < 60) return `${min} min ago`;
-    const hours = Math.floor(min / 60);
-    if (hours < 24) return `${hours} hr ago`;
-    const days = Math.floor(hours / 24);
-    return `${days} day${days > 1 ? 's' : ''} ago`;
+    const h = Math.floor(min / 60);
+    if (h < 24) return `${h} hr ago`;
+    const d = Math.floor(h / 24);
+    return `${d} day${d > 1 ? 's' : ''} ago`;
 }
 
-// ── Reddit post type ──────────────────────────────────────────────────────────
-interface RedditPost {
-    id: string;
-    name: string;
-    title: string;
-    selftext: string;
-    author: string;
-    created_utc: number;
-    score: number;
-    link_flair_text: string | null;
+// ── Post shape ────────────────────────────────────────────────────────────────
+interface Post {
+    id: string; title: string; body: string;
+    author: string; created_utc: number; score: number; flair: string | null;
 }
 
-// ── Plain data shape (no Mongoose Document fields needed for insert) ──────────
-interface RedditAlertData {
-    redditId: string; urgency: string; sourceDetails: string; title: string;
-    time: string; location: string; lat: number; lng: number; need: string;
-    fullMessage: string; userId: string; alertType: string; message: string;
-    coordinates: string; createdAt: number;
+// ── Parse old.reddit.com JSON response ───────────────────────────────────────
+
+function parseRedditJSON(json: unknown): Post[] {
+    const children = (json as any)?.data?.children ?? [];
+    return (children as any[]).map((c: any) => ({
+        id:          c.data.id,
+        title:       c.data.title ?? '',
+        body:        c.data.selftext ?? '',
+        author:      c.data.author ?? 'unknown',
+        created_utc: c.data.created_utc ?? Math.floor(Date.now() / 1000),
+        score:       c.data.score ?? 0,
+        flair:       c.data.link_flair_text ?? null,
+    }));
 }
 
-// ── Convert a Reddit post → RedditAlertData ───────────────────────────────────
-async function postToAlert(post: RedditPost): Promise<RedditAlertData> {
-    const fullText = `${post.title} ${post.selftext}`;
-    const flair    = post.link_flair_text ?? '';
 
-    const { urgency, alertType, sourcedFromFlair } = resolveUrgencyAndType(fullText, flair);
-
-    // sourceDetails: show flair origin or NLP confidence
-    const confidence    = calcConfidence(fullText, post.score);
-    const sourceDetails = sourcedFromFlair
-        ? `Flair: ${flair}`
-        : `NLP: ${confidence}%`;
-
-    const locationName    = extractLocationName(fullText);
-    const { lat, lng }    = locationName ? await geocode(locationName) : DEFAULT_COORDS;
-    const displayLocation = locationName ?? 'Unknown Location';
+// ── Convert post → DB/socket shape ───────────────────────────────────────────
+async function toAlert(p: Post) {
+    const text = `${p.title} ${p.body}`;
+    const { urgency, alertType, sourcedFromFlair } = resolveUrgency(text, p.flair ?? '');
+    const conf    = confidence(text, p.score);
+    const srcDet  = sourcedFromFlair ? `Flair: ${p.flair}` : `NLP: ${conf}%`;
+    const locName = extractLocation(text);
+    const { lat, lng } = locName ? await geocode(locName) : DEFAULT_COORDS;
     const coords = `${Math.abs(lat).toFixed(4)}° ${lat >= 0 ? 'N' : 'S'}, ${Math.abs(lng).toFixed(4)}° ${lng >= 0 ? 'E' : 'W'}`;
-
     return {
-        redditId:      post.id,
-        urgency,
-        sourceDetails,
-        // Strip any manual [CATEGORY] prefix from title, and also the flair text if repeated
-        title:         post.title.replace(/^\[.*?\]\s*/i, '').trim(),
-        time:          timeAgo(post.created_utc),
-        location:      displayLocation,
-        lat,
-        lng,
+        redditId:      p.id,
+        urgency,       sourceDetails: srcDet,
+        title:         p.title.replace(/^\[.*?\]\s*/i, '').trim(),
+        time:          timeAgo(p.created_utc),
+        location:      locName ?? 'Unknown Location',
+        lat,           lng,
         need:          alertType,
-        fullMessage:   post.selftext || post.title,
-        userId:        `u/${post.author}`,
+        fullMessage:   p.body || p.title,
+        userId:        `u/${p.author}`,
         alertType,
-        message:       (post.selftext || post.title).slice(0, 200),
+        message:       (p.body || p.title).slice(0, 200),
         coordinates:   coords,
-        createdAt:     post.created_utc * 1000,
+        createdAt:     p.created_utc * 1000,
     };
 }
 
-// ── Fetch Reddit + persist new posts ─────────────────────────────────────────
-async function pollAndPersist(io: Server): Promise<void> {
+// ── Poll loop ─────────────────────────────────────────────────────────────────
+let pollCount = 0;
+async function poll(io: Server): Promise<void> {
+    pollCount++;
+    const cycle = `[Poll #${pollCount}]`;
     try {
-        // After the first poll, only ask Reddit for posts newer than our last
-        // known one via `before=` — keeps each request tiny and fast.
-        const url = latestPostName
-            ? `${REDDIT_BASE}&before=${encodeURIComponent(latestPostName)}`
-            : REDDIT_BASE;
-
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 10_000);
-        const res = await fetch(url, {
-            headers: { 'User-Agent': USER_AGENT },
-            signal: controller.signal,
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 10_000);
+        const res = await fetch(REDDIT_URL, {
+            headers: {
+                'User-Agent': USER_AGENT,
+                'Accept':     'application/json',
+            },
+            signal: ctrl.signal,
         });
-        clearTimeout(timer);
-        if (!res.ok) { console.warn(`[RedditService] Reddit returned ${res.status}`); return; }
+        clearTimeout(t);
 
-        const json = await res.json();
-        const posts: RedditPost[] = (json?.data?.children ?? []).map(
-            (c: { data: RedditPost }) => c.data
-        );
-
-        // Always advance the cursor to the newest post we've seen.
-        if (posts.length > 0) {
-            latestPostName = posts[0].name; // /new is sorted newest-first
+        if (!res.ok) {
+            console.warn(`[RedditService]${cycle} Reddit returned HTTP ${res.status} — skipping`);
+            return;
         }
 
+        const posts = parseRedditJSON(await res.json());
+        console.log(`[RedditService]${cycle} Fetched ${posts.length} posts from Reddit`);
         if (!posts.length) return;
 
-        // DB dedup — safety net for restarts / race conditions
-        const ids = posts.map(p => p.id);
-        const existing = await RedditAlert.find({ redditId: { $in: ids } }).select('redditId').lean();
-        const existingIds = new Set(existing.map(d => d.redditId));
+        // Dedup against DB
+        const ids   = posts.map(p => p.id);
+        const exist = await RedditAlert.find({ redditId: { $in: ids } }).select('redditId').lean();
+        const seen  = new Set(exist.map(d => d.redditId));
+        const fresh = posts.filter(p => !seen.has(p.id));
+        console.log(`[RedditService]${cycle} In DB already: ${exist.length} | Fresh/new: ${fresh.length}`);
 
-        const newPosts = posts.filter(p => !existingIds.has(p.id));
-        if (!newPosts.length) {
-            return; // silent — normal when polling every 10 s
+        if (!fresh.length) {
+            console.log(`[RedditService]${cycle} No new posts — nothing to save`);
+            return;
         }
 
-        console.log(`[RedditService] ${newPosts.length} new post(s) found — geocoding & saving…`);
+        console.log(`[RedditService]${cycle} Saving ${fresh.length} new post(s)…`);
+        const alerts = await Promise.all(fresh.map(toAlert));
 
-        // Convert all new posts to alerts (no keyword filtering!)
-        const alerts = await Promise.all(newPosts.map(postToAlert));
+        try {
+            await RedditAlert.insertMany(alerts, { ordered: false });
+            console.log(`[RedditService]${cycle} Saved to DB successfully`);
+        } catch (insertErr: any) {
+            console.warn(`[RedditService]${cycle} insertMany warning:`, insertErr.message);
+        }
 
-        // Bulk-insert (ordered: false → continue on duplicate key errors)
-        await RedditAlert.insertMany(alerts.map(a => ({ ...a })), { ordered: false }).catch(() => {});
-
-        // Broadcast each new alert as the dashboard-ready LiveAlert shape
-        for (const alert of alerts) {
-            const liveAlert = {
-                id:            `REDDIT-${alert.redditId}`,
-                urgency:       alert.urgency,
-                source:        'social' as const,
-                sourceDetails: alert.sourceDetails,
-                title:         alert.title,
-                time:          alert.time,
-                location:      alert.location,
-                lat:           alert.lat,
-                lng:           alert.lng,
-                need:          alert.need,
-                fullMessage:   alert.fullMessage,
-                userId:        alert.userId,
-                alertType:     alert.alertType,
-                message:       alert.message,
-                coordinates:   alert.coordinates,
-                createdAt:     alert.createdAt,
-            };
-            io.emit('new_reddit_alert', liveAlert);
-            console.log(`[RedditService] Broadcast → ${liveAlert.title}`);
+        for (const a of alerts) {
+            io.emit('new_reddit_alert', { id: `REDDIT-${a.redditId}`, source: 'social', ...a });
+            console.log(`[RedditService]${cycle} emitted: "${a.title}"`);
         }
     } catch (err) {
-        console.error('[RedditService] Poll error:', err);
+        console.error(`[RedditService]${cycle} Error:`, err);
     }
 }
 
-// ── Public: start the poller ──────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 export function startRedditPoller(io: Server): void {
-    console.log(`[RedditService] Poller started — interval ${POLL_INTERVAL / 1000}s`);
-    pollAndPersist(io);
-    setInterval(() => pollAndPersist(io), POLL_INTERVAL);
+    console.log(`[RedditService] Polling r/${SUBREDDIT} every ${POLL_INTERVAL / 1000}s`);
+    poll(io);
+    setInterval(() => poll(io), POLL_INTERVAL);
 }
+
