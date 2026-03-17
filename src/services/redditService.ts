@@ -8,6 +8,7 @@
 
 import { Server } from 'socket.io';
 import RedditAlert from '../models/RedditAlert';
+import DeletedRedditId from '../models/DeletedRedditId';
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const SUBREDDIT     = 'ResQMesh';
@@ -159,6 +160,21 @@ async function toAlert(p: Post) {
     };
 }
 
+// ── Permanently-deleted blocklist ───────────────────────────────────────────
+// redditIds manually deleted by the user — never re-insert these
+const permanentlyDeleted = new Set<string>();
+
+export async function markDeleted(redditId: string): Promise<void> {
+    permanentlyDeleted.add(redditId);
+    await DeletedRedditId.updateOne({ redditId }, { redditId }, { upsert: true });
+}
+
+async function loadDeletedIds(): Promise<void> {
+    const docs = await DeletedRedditId.find({}).select('redditId').lean();
+    docs.forEach(d => permanentlyDeleted.add(d.redditId));
+    console.log(`[RedditService] Loaded ${permanentlyDeleted.size} permanently-deleted IDs into blocklist`);
+}
+
 // ── Poll loop ─────────────────────────────────────────────────────────────────
 let pollCount = 0;
 async function poll(io: Server): Promise<void> {
@@ -185,11 +201,11 @@ async function poll(io: Server): Promise<void> {
         console.log(`[RedditService]${cycle} Fetched ${posts.length} posts from Reddit`);
         if (!posts.length) return;
 
-        // Dedup against DB
+        // Dedup against DB — also skip permanently-deleted posts
         const ids   = posts.map(p => p.id);
         const exist = await RedditAlert.find({ redditId: { $in: ids } }).select('redditId').lean();
         const seen  = new Set(exist.map(d => d.redditId));
-        const fresh = posts.filter(p => !seen.has(p.id));
+        const fresh = posts.filter(p => !seen.has(p.id) && !permanentlyDeleted.has(p.id));
         console.log(`[RedditService]${cycle} In DB already: ${exist.length} | Fresh/new: ${fresh.length}`);
 
         if (!fresh.length) {
@@ -217,7 +233,8 @@ async function poll(io: Server): Promise<void> {
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
-export function startRedditPoller(io: Server): void {
+export async function startRedditPoller(io: Server): Promise<void> {
+    await loadDeletedIds();   // ← load blocklist BEFORE first poll
     console.log(`[RedditService] Polling r/${SUBREDDIT} every ${POLL_INTERVAL / 1000}s`);
     poll(io);
     setInterval(() => poll(io), POLL_INTERVAL);

@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import RedditAlert from '../models/RedditAlert';
+import { markDeleted } from '../services/redditService';
 
 const router = Router();
 
@@ -54,6 +55,38 @@ router.get('/', async (_req: Request, res: Response) => {
         res.status(200).json({ success: true, alerts: liveAlerts });
     } catch (error) {
         console.error('[RedditAlerts] Error fetching from DB:', error);
+        res.status(500).json({ success: false, error: 'Internal server error.' });
+    }
+});
+
+/**
+ * DELETE /api/reddit-alerts/:redditId
+ * 
+ * 1. Adds the redditId to the permanent in-memory blocklist AND persists it
+ *    to the DeletedRedditId collection so it survives server restarts.
+ * 2. Removes the alert from RedditAlert collection.
+ * 
+ * The poller checks the blocklist before inserting any post, so a deleted post
+ * will NEVER come back — even if it is still live on Reddit.
+ */
+router.delete('/:redditId', async (req: Request, res: Response) => {
+    const redditId = req.params.redditId as string;
+    try {
+        // Step 1 — record in permanent blocklist (in-memory + DB)
+        await markDeleted(redditId);
+
+        // Step 2 — remove from active alerts collection
+        const result = await RedditAlert.deleteOne({ redditId });
+
+        if (result.deletedCount === 0) {
+            // Already gone from DB — but blocklist is still written, so that's fine
+            return res.status(404).json({ success: false, error: 'Alert not found in DB (already deleted?).' });
+        }
+
+        console.log(`[RedditAlerts] Permanently deleted & blocklisted redditId: ${redditId}`);
+        res.status(200).json({ success: true, message: `Alert ${redditId} deleted and blocklisted.` });
+    } catch (error) {
+        console.error('[RedditAlerts] Error deleting alert:', error);
         res.status(500).json({ success: false, error: 'Internal server error.' });
     }
 });
